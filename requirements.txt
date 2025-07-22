@@ -1,0 +1,6 @@
+aiohttp>=3.9.0
+asyncio>=3.4.3
+rich>=13.7.0
+cryptography>=41.0.0
+requests>=2.31.0
+cryptography>=41.0.0

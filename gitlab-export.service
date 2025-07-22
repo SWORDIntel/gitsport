@@ -1,0 +1,33 @@
+[Unit]
+Description=GitLab Project Export Service
+After=network.target
+
+[Service]
+Type=oneshot
+User=gitlab-export
+Group=gitlab-export
+WorkingDirectory=/opt/gitlab-export
+Environment="PATH=/opt/gitlab-export/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+# For environment variable mode
+Environment="GITLAB_USE_ENV_VARS=true"
+Environment="GITLAB_INSTANCE_0_NAME=production"
+Environment="GITLAB_INSTANCE_0_URL=https://gitlab.example.com"
+EnvironmentFile=-/etc/gitlab-export/credentials.env
+
+ExecStart=/opt/gitlab-export/venv/bin/python /opt/gitlab-export/gitlab_export_secure.py
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/gitlab-export/exports
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gitlab-export
+
+[Install]
+WantedBy=multi-user.target

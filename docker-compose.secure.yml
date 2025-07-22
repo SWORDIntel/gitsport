@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Batch mode - runs once and exits
+  gitlab-exporter-batch:
+    build:
+      context: .
+      dockerfile: Dockerfile.secure
+    container_name: gitlab-exporter-batch
+    volumes:
+      # Export directory
+      - ./exports:/app/exports
+      # Optional: Mount encrypted credentials
+      # - ./credentials.enc:/app/credentials.enc:ro
+    environment:
+      # Use environment variables mode
+      - GITLAB_USE_ENV_VARS=true
+      - GITLAB_INSTANCE_0_NAME=production
+      - GITLAB_INSTANCE_0_URL=${GITLAB_PROD_URL}
+      - GITLAB_INSTANCE_0_TOKEN=${GITLAB_PROD_TOKEN}
+      # Add more instances as needed
+      # - GITLAB_INSTANCE_1_NAME=staging
+      # - GITLAB_INSTANCE_1_URL=${GITLAB_STAGE_URL}
+      # - GITLAB_INSTANCE_1_TOKEN=${GITLAB_STAGE_TOKEN}
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # Scheduled mode - runs periodically
+  gitlab-exporter-scheduled:
+    build:
+      context: .
+      dockerfile: Dockerfile.secure
+    container_name: gitlab-exporter-scheduled
+    volumes:
+      - ./exports:/app/exports
+      - ./credentials.enc:/app/credentials.enc:ro
+    environment:
+      - GITLAB_USE_ENV_VARS=false
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "-c"]
+    command: |
+      "while true; do
+        echo '[INFO] Starting scheduled export at ' $$(date)
+        python gitlab_export_secure.py
+        echo '[INFO] Export complete. Sleeping for 24 hours...'
+        sleep 86400
+      done"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M

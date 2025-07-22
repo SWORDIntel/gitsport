@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  gitlab-exporter:
+    build: .
+    container_name: gitlab-mass-exporter
+    volumes:
+      # Mount your config file
+      - ./gitlab_instances.txt:/app/gitlab_instances.txt:ro
+      # Export directory
+      - ./exports:/app/exports
+    environment:
+      # Optional: Use environment variables instead of config file
+      # - GITLAB_USE_ENV_VARS=true
+      # - GITLAB_INSTANCE_0_NAME=production
+      # - GITLAB_INSTANCE_0_URL=https://gitlab.example.com
+      # - GITLAB_INSTANCE_0_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx
+    tty: true
+    stdin_open: true
+    # Note: The async TUI requires interactive mode
+    # For non-interactive batch mode, use gitlab_export_secure.py instead
+    network_mode: host  # For better performance
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M

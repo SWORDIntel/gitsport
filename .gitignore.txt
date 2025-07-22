@@ -1,0 +1,69 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+
+# Sensitive Configuration Files
+gitlab_instances.txt
+config.json
+credentials.enc
+.gitlab_export_key
+export_settings.json
+
+# Environment files
+.env
+*.env
+
+# Export Data
+exports/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/

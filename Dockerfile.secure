@@ -1,0 +1,48 @@
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application files
+COPY gitlab_export_secure.py .
+COPY convert_config.py .
+
+# Create necessary directories
+RUN mkdir -p /app/exports
+
+# Create entrypoint script for secure version
+RUN echo '#!/bin/bash\n\
+if [ "$GITLAB_USE_ENV_VARS" = "true" ]; then\n\
+    echo "[INFO] Using environment variables for configuration"\n\
+    python gitlab_export_secure.py\n\
+elif [ -f /app/credentials.enc ]; then\n\
+    echo "[INFO] Using encrypted credentials file"\n\
+    python gitlab_export_secure.py\n\
+else\n\
+    echo "[ERROR] No configuration found!"\n\
+    echo "Either:"\n\
+    echo "1. Set GITLAB_USE_ENV_VARS=true and provide GITLAB_INSTANCE_* variables"\n\
+    echo "2. Mount encrypted credentials to /app/credentials.enc"\n\
+    exit 1\n\
+fi\n\
+' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
+
+# Volume for exports
+VOLUME ["/app/exports"]
+
+# Volume for encrypted credentials (optional)
+VOLUME ["/app/credentials.enc"]
+
+ENTRYPOINT ["/app/entrypoint.sh"]
