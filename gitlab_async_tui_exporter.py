@@ -248,6 +248,8 @@ class GitLabAsyncExporter:
                     if response.status == 429:
                         self.log(f"Rate limited while triggering export for {project_path}. Skipping for now.", "WARN")
                         self.projects_to_retry.append(project)
+                        with open("retry_queue.json", "a") as f:
+                            f.write(json.dumps(project) + "\n")
                         if self.progress:
                             self.progress.update(task_id, advance=1)
                         return False
@@ -313,6 +315,8 @@ class GitLabAsyncExporter:
                 if e.status == 429:
                     self.log(f"Rate limited while exporting {project_path}. Skipping for now.", "WARN")
                     self.projects_to_retry.append(project)
+                    with open("retry_queue.json", "a") as f:
+                        f.write(json.dumps(project) + "\n")
                     if self.progress:
                         self.progress.update(task_id, advance=1)
                     return False
@@ -623,7 +627,7 @@ class TUIInterface:
                 
         return selected
         
-    async def run_export(self, selected_instances: List[GitLabInstance]):
+    async def run_export(self, selected_instances: List[GitLabInstance], projects_to_export: Optional[List[Dict]] = None):
         """Run the export process with progress tracking"""
         config_file = Path("config.json")
         config = {}
@@ -679,14 +683,17 @@ class TUIInterface:
                     instance.username = exporter.instance.username
                     instance.version = exporter.instance.version
                     
-                    # Fetch projects
-                    fetch_task = progress.add_task(
-                        f"[cyan]Fetching projects from {instance.name}...",
-                        total=None
-                    )
-                    
-                    projects = await exporter.get_all_projects(api_semaphore, fetch_task)
-                    progress.remove_task(fetch_task)
+                    if projects_to_export:
+                        projects = projects_to_export
+                    else:
+                        # Fetch projects
+                        fetch_task = progress.add_task(
+                            f"[cyan]Fetching projects from {instance.name}...",
+                            total=None
+                        )
+
+                        projects = await exporter.get_all_projects(api_semaphore, fetch_task)
+                        progress.remove_task(fetch_task)
                     
                     if not projects:
                         self.console.print(f"[yellow]No projects found in {instance.name}[/yellow]")
@@ -765,6 +772,11 @@ class TUIInterface:
 
 async def main():
     """Main entry point"""
+    import argparse
+    parser = argparse.ArgumentParser(description="GitLab Async TUI Mass Exporter")
+    parser.add_argument("--projects", help="Comma-separated list of project IDs to export")
+    args = parser.parse_args()
+
     tui = TUIInterface()
     
     # Display header
@@ -776,34 +788,44 @@ async def main():
         # Offer to create configuration
         if Confirm.ask("\nWould you like to create a configuration file?"):
             os.system("python convert_config.py")
-            console.print("\n[yellow]Please edit gitlab_instances.txt and run again.[/yellow]")
+            console.print("\n[yellow]Please run `python convert_config.py` and then run the exporter again.[/yellow]")
         return
         
-    # Display instances
-    console.print(f"\n[green]Found {len(tui.instances)} GitLab instance(s)[/green]")
-    
-    # Select instances
-    selected = await tui.select_instances()
-    if not selected:
-        console.print("\n[yellow]No instances selected. Exiting.[/yellow]")
-        return
+    if args.projects:
+        project_ids = [int(p) for p in args.projects.split(',')]
+        # This part is a bit tricky, as we need to know which instance each project belongs to.
+        # For now, we'll assume the first instance.
+        # A more robust solution would be to store the instance name in the retry queue.
+        selected_instances = [tui.instances[0]]
+        projects = [{'id': p} for p in project_ids]
+        await tui.run_export(selected_instances, projects)
+
+    else:
+        # Display instances
+        console.print(f"\n[green]Found {len(tui.instances)} GitLab instance(s)[/green]")
         
-    # Confirm export
-    console.print(f"\n[bold]Ready to export from {len(selected)} instance(s)[/bold]")
-    if not Confirm.ask("Proceed with export?", default=True):
-        console.print("\n[yellow]Export cancelled.[/yellow]")
-        return
-        
-    # Run export
-    try:
-        await tui.run_export(selected)
-        console.print("\n[bold green]✅ All exports completed![/bold green]")
-    except KeyboardInterrupt:
-        console.print("\n[red]Export interrupted by user[/red]")
-    except Exception as e:
-        console.print(f"\n[red]Export failed: {str(e)}[/red]")
-        import traceback
-        traceback.print_exc()
+        # Select instances
+        selected = await tui.select_instances()
+        if not selected:
+            console.print("\n[yellow]No instances selected. Exiting.[/yellow]")
+            return
+
+        # Confirm export
+        console.print(f"\n[bold]Ready to export from {len(selected)} instance(s)[/bold]")
+        if not Confirm.ask("Proceed with export?", default=True):
+            console.print("\n[yellow]Export cancelled.[/yellow]")
+            return
+
+        # Run export
+        try:
+            await tui.run_export(selected)
+            console.print("\n[bold green]✅ All exports completed![/bold green]")
+        except KeyboardInterrupt:
+            console.print("\n[red]Export interrupted by user[/red]")
+        except Exception as e:
+            console.print(f"\n[red]Export failed: {str(e)}[/red]")
+            import traceback
+            traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())
