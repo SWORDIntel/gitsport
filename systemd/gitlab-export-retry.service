@@ -1,0 +1,6 @@
+[Unit]
+Description=GitLab Export Retry Service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/github/gitsport/restart_export.py
