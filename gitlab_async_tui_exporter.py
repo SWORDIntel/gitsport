@@ -70,11 +70,11 @@ class ExportStats:
 class GitLabAsyncExporter:
     """Async GitLab exporter with progress tracking"""
     
-    def __init__(self, instance: GitLabInstance, export_dir: Path, max_concurrent: int = 3):
+    def __init__(self, instance: GitLabInstance, export_dir: Path, max_concurrent_downloads: int = 5):
         self.instance = instance
         self.export_dir = export_dir / instance.name / datetime.now().strftime('%Y%m%d_%H%M%S')
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        self.max_concurrent = max_concurrent
+        self.max_concurrent_downloads = max_concurrent_downloads
         self.stats = ExportStats()
         self.session: Optional[aiohttp.ClientSession] = None
         self.progress: Optional[Progress] = None
@@ -213,6 +213,18 @@ class GitLabAsyncExporter:
                 async with self.session.post(
                     f"{self.instance.url}/api/v4/projects/{project_id}/export"
                 ) as response:
+                    if response.status == 429:
+                        self.log(f"Rate limited while triggering export for {project_path}. Retrying after 60s.", "WARN")
+                        await asyncio.sleep(60)
+                        return await self.export_project(project, semaphore, task_id)
+
+                    if response.status == 403:
+                        self.log(f"Access forbidden to trigger export for {project_path}.", "ERROR")
+                        self.stats.projects_failed += 1
+                        if self.progress:
+                            self.progress.update(task_id, advance=1)
+                        return False
+
                     if response.status not in [200, 202]:
                         self.log(f"Failed to start export for {project_path}: {response.status}", "ERROR")
                         self.stats.projects_failed += 1
@@ -267,29 +279,52 @@ class GitLabAsyncExporter:
                 return False
                 
     async def download_export(self, project_id: int, project_path: str, export_file: Path) -> bool:
-        """Download project export file"""
+        """Download project export file with resume support"""
         try:
             export_file.parent.mkdir(parents=True, exist_ok=True)
             
+            headers = {}
+            file_mode = 'wb'
+            downloaded_size = 0
+
+            if export_file.exists():
+                downloaded_size = export_file.stat().st_size
+                headers['Range'] = f'bytes={downloaded_size}-'
+                file_mode = 'ab'
+
             async with self.session.get(
-                f"{self.instance.url}/api/v4/projects/{project_id}/export/download"
+                f"{self.instance.url}/api/v4/projects/{project_id}/export/download",
+                headers=headers
             ) as response:
-                if response.status != 200:
+
+                if response.status == 429:
+                    self.log(f"Rate limited while downloading {project_path}. Retrying after 60s.", "WARN")
+                    await asyncio.sleep(60)
+                    return await self.download_export(project_id, project_path, export_file)
+
+                if response.status == 403:
+                    self.log(f"Access forbidden to download {project_path}.", "ERROR")
+                    return False
+
+                if response.status not in [200, 206]:
                     self.log(f"Failed to download export for {project_path}: {response.status}", "ERROR")
                     return False
-                    
-                total_size = int(response.headers.get('content-length', 0))
+
+                total_size = int(response.headers.get('Content-Length', 0))
                 
-                with open(export_file, 'wb') as f:
-                    downloaded = 0
+                with open(export_file, file_mode) as f:
                     async for chunk in response.content.iter_chunked(8192):
                         f.write(chunk)
-                        downloaded += len(chunk)
-                
+
                 self.stats.total_size += total_size
-                self.log(f"Downloaded {project_path} ({total_size / 1024 / 1024:.1f} MB)", "SUCCESS")
-                return True
+                size_in_mb = (downloaded_size + total_size) / 1024 / 1024
                 
+                if file_mode == 'ab':
+                    self.log(f"Resumed and completed download for {project_path} ({size_in_mb:.1f} MB)", "SUCCESS")
+                else:
+                    self.log(f"Downloaded {project_path} ({size_in_mb:.1f} MB)", "SUCCESS")
+                return True
+
         except Exception as e:
             self.log(f"Exception downloading {project_path}: {str(e)}", "ERROR")
             return False
@@ -566,6 +601,11 @@ class TUIInterface:
         
     async def run_export(self, selected_instances: List[GitLabInstance]):
         """Run the export process with progress tracking"""
+        max_concurrent_downloads = Prompt.ask(
+            "[bold cyan]Enter max concurrent downloads[/bold cyan]",
+            default="5"
+        )
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -578,7 +618,7 @@ class TUIInterface:
             for instance in selected_instances:
                 self.console.print(f"\n[bold cyan]Processing {instance.name}...[/bold cyan]")
                 
-                async with GitLabAsyncExporter(instance, Path("exports"), max_concurrent=3) as exporter:
+                async with GitLabAsyncExporter(instance, Path("exports"), max_concurrent_downloads=int(max_concurrent_downloads)) as exporter:
                     exporter.progress = progress
                     
                     # Validate connection
@@ -612,7 +652,7 @@ class TUIInterface:
                     )
                     
                     # Create semaphore for concurrency control
-                    semaphore = asyncio.Semaphore(exporter.max_concurrent)
+                    semaphore = asyncio.Semaphore(exporter.max_concurrent_downloads)
                     
                     # Export all projects concurrently
                     export_tasks = [
