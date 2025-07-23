@@ -106,6 +106,7 @@ class GitLabAsyncExporter:
         self.max_concurrent_api_calls = max_concurrent_api_calls
         self.stats = ExportStats()
         self.failed_projects = []
+        self.projects_to_retry = []
         self.session: Optional[aiohttp.ClientSession] = None
         self.progress: Optional[Progress] = None
         self.log_file = self.export_dir / "export.log"
@@ -220,7 +221,6 @@ class GitLabAsyncExporter:
         self.instance.projects_count = len(projects)
         return projects
         
-    @async_retry_with_backoff()
     async def export_project(self, project: Dict, semaphore: asyncio.Semaphore, task_id: int) -> bool:
         """Export a single project"""
         async with semaphore:
@@ -245,7 +245,12 @@ class GitLabAsyncExporter:
                 async with self.session.post(
                     f"{self.instance.url}/api/v4/projects/{project_id}/export"
                 ) as response:
-                    response.raise_for_status()
+                    if response.status == 429:
+                        self.log(f"Rate limited while triggering export for {project_path}. Skipping for now.", "WARN")
+                        self.projects_to_retry.append(project)
+                        if self.progress:
+                            self.progress.update(task_id, advance=1)
+                        return False
 
                     if response.status == 403:
                         self.log(f"Access forbidden to trigger export for {project_path}.", "ERROR")
@@ -304,6 +309,20 @@ class GitLabAsyncExporter:
                     self.progress.update(task_id, advance=1)
                 return False
                 
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    self.log(f"Rate limited while exporting {project_path}. Skipping for now.", "WARN")
+                    self.projects_to_retry.append(project)
+                    if self.progress:
+                        self.progress.update(task_id, advance=1)
+                    return False
+                else:
+                    self.log(f"Exception exporting {project_path}: {str(e)}", "ERROR")
+                    self.stats.projects_failed += 1
+                    self.failed_projects.append(project)
+                    if self.progress:
+                        self.progress.update(task_id, advance=1)
+                    return False
             except Exception as e:
                 self.log(f"Exception exporting {project_path}: {str(e)}", "ERROR")
                 self.stats.projects_failed += 1
@@ -688,6 +707,16 @@ class TUIInterface:
                     ]
                     
                     await asyncio.gather(*export_tasks)
+
+                    if exporter.projects_to_retry:
+                        self.console.print(f"\n[bold yellow]Retrying {len(exporter.projects_to_retry)} rate-limited projects...[/bold yellow]")
+                        await asyncio.sleep(60)  # Wait for a minute before retrying
+
+                        retry_tasks = [
+                            exporter.export_project(project, download_semaphore, export_task)
+                            for project in exporter.projects_to_retry
+                        ]
+                        await asyncio.gather(*retry_tasks)
                     
                     # Export additional data
                     self.console.print(f"[cyan]Exporting wikis and snippets...[/cyan]")
