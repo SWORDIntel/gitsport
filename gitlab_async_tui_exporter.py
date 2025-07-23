@@ -627,6 +627,10 @@ class TUIInterface:
         with open(config_file, 'w') as f:
             json.dump(config, f, indent=2)
 
+        # Create semaphores for concurrency control
+        download_semaphore = asyncio.Semaphore(int(max_concurrent_downloads))
+        api_semaphore = asyncio.Semaphore(int(max_concurrent_api_calls))
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -677,10 +681,6 @@ class TUIInterface:
                         total=len(projects)
                     )
                     
-                    # Create semaphores for concurrency control
-                    download_semaphore = asyncio.Semaphore(exporter.max_concurrent_downloads)
-                    api_semaphore = asyncio.Semaphore(exporter.max_concurrent_api_calls)
-
                     # Export all projects concurrently
                     export_tasks = [
                         exporter.export_project(project, download_semaphore, export_task)
