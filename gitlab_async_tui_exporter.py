@@ -25,14 +25,41 @@ from rich.align import Align
 from concurrent.futures import ThreadPoolExecutor
 import tarfile
 import base64
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Callable
+from functools import wraps
 from dataclasses import dataclass, field
 from collections import defaultdict
 import hashlib
 from urllib.parse import urlparse
 import re
+import random
 
 console = Console()
+
+def async_retry_with_backoff(retries=5, backoff_in_seconds=1):
+    def r_decorator(f):
+        @wraps(f)
+        async def wrapper(*args, **kwargs):
+            self = args[0]
+            x = 0
+            while True:
+                try:
+                    return await f(*args, **kwargs)
+                except aiohttp.ClientResponseError as e:
+                    if e.status == 429:
+                        if x < retries:
+                            sleep = (backoff_in_seconds * 2 ** x + random.random())
+                            self.log(f"Rate limited. Retrying in {sleep:.2f} seconds.", "WARN")
+                            self.stats.retries += 1
+                            await asyncio.sleep(sleep)
+                            x += 1
+                        else:
+                            self.log(f"Rate limited. Max retries exceeded.", "ERROR")
+                            raise
+                    else:
+                        raise
+        return wrapper
+    return r_decorator
 
 @dataclass
 class GitLabInstance:
@@ -56,6 +83,7 @@ class ExportStats:
     wikis_exported: int = 0
     snippets_exported: int = 0
     total_size: int = 0
+    retries: int = 0
     start_time: float = field(default_factory=time.time)
     
     @property
@@ -70,12 +98,14 @@ class ExportStats:
 class GitLabAsyncExporter:
     """Async GitLab exporter with progress tracking"""
     
-    def __init__(self, instance: GitLabInstance, export_dir: Path, max_concurrent: int = 3):
+    def __init__(self, instance: GitLabInstance, export_dir: Path, max_concurrent_downloads: int = 5, max_concurrent_api_calls: int = 10):
         self.instance = instance
         self.export_dir = export_dir / instance.name / datetime.now().strftime('%Y%m%d_%H%M%S')
         self.export_dir.mkdir(parents=True, exist_ok=True)
-        self.max_concurrent = max_concurrent
+        self.max_concurrent_downloads = max_concurrent_downloads
+        self.max_concurrent_api_calls = max_concurrent_api_calls
         self.stats = ExportStats()
+        self.failed_projects = []
         self.session: Optional[aiohttp.ClientSession] = None
         self.progress: Optional[Progress] = None
         self.log_file = self.export_dir / "export.log"
@@ -140,7 +170,7 @@ class GitLabAsyncExporter:
             self.log(f"Connection failed: {str(e)}", "ERROR")
             return False
             
-    async def get_all_projects(self, task_id: Optional[int] = None) -> List[Dict]:
+    async def get_all_projects(self, semaphore: asyncio.Semaphore, task_id: Optional[int] = None) -> List[Dict]:
         """Fetch all accessible projects"""
         projects = []
         page = 1
@@ -159,15 +189,16 @@ class GitLabAsyncExporter:
                     'with_merge_requests_enabled': 'true'
                 }
                 
-                async with self.session.get(
-                    f"{self.instance.url}/api/v4/projects",
-                    params=params
-                ) as response:
-                    if response.status != 200:
-                        self.log(f"Failed to fetch projects page {page}: {response.status}", "ERROR")
-                        break
-                        
-                    page_projects = await response.json()
+                async with semaphore:
+                    async with self.session.get(
+                        f"{self.instance.url}/api/v4/projects",
+                        params=params
+                    ) as response:
+                        if response.status != 200:
+                            self.log(f"Failed to fetch projects page {page}: {response.status}", "ERROR")
+                            break
+
+                        page_projects = await response.json()
                     if not page_projects:
                         break
                         
@@ -189,6 +220,7 @@ class GitLabAsyncExporter:
         self.instance.projects_count = len(projects)
         return projects
         
+    @async_retry_with_backoff()
     async def export_project(self, project: Dict, semaphore: asyncio.Semaphore, task_id: int) -> bool:
         """Export a single project"""
         async with semaphore:
@@ -213,9 +245,20 @@ class GitLabAsyncExporter:
                 async with self.session.post(
                     f"{self.instance.url}/api/v4/projects/{project_id}/export"
                 ) as response:
+                    response.raise_for_status()
+
+                    if response.status == 403:
+                        self.log(f"Access forbidden to trigger export for {project_path}.", "ERROR")
+                        self.stats.projects_failed += 1
+                        self.failed_projects.append(project)
+                        if self.progress:
+                            self.progress.update(task_id, advance=1)
+                        return False
+
                     if response.status not in [200, 202]:
                         self.log(f"Failed to start export for {project_path}: {response.status}", "ERROR")
                         self.stats.projects_failed += 1
+                        self.failed_projects.append(project)
                         if self.progress:
                             self.progress.update(task_id, advance=1)
                         return False
@@ -248,6 +291,7 @@ class GitLabAsyncExporter:
                         elif export_status == 'failed':
                             self.log(f"Export failed for {project_path}", "ERROR")
                             self.stats.projects_failed += 1
+                            self.failed_projects.append(project)
                             if self.progress:
                                 self.progress.update(task_id, advance=1)
                             return False
@@ -255,6 +299,7 @@ class GitLabAsyncExporter:
                 # Timeout
                 self.log(f"Export timeout for {project_path}", "ERROR")
                 self.stats.projects_failed += 1
+                self.failed_projects.append(project)
                 if self.progress:
                     self.progress.update(task_id, advance=1)
                 return False
@@ -262,39 +307,60 @@ class GitLabAsyncExporter:
             except Exception as e:
                 self.log(f"Exception exporting {project_path}: {str(e)}", "ERROR")
                 self.stats.projects_failed += 1
+                self.failed_projects.append(project)
                 if self.progress:
                     self.progress.update(task_id, advance=1)
                 return False
                 
+    @async_retry_with_backoff()
     async def download_export(self, project_id: int, project_path: str, export_file: Path) -> bool:
-        """Download project export file"""
+        """Download project export file with resume support"""
         try:
             export_file.parent.mkdir(parents=True, exist_ok=True)
             
+            headers = {}
+            file_mode = 'wb'
+            downloaded_size = 0
+
+            if export_file.exists():
+                downloaded_size = export_file.stat().st_size
+                headers['Range'] = f'bytes={downloaded_size}-'
+                file_mode = 'ab'
+
             async with self.session.get(
-                f"{self.instance.url}/api/v4/projects/{project_id}/export/download"
+                f"{self.instance.url}/api/v4/projects/{project_id}/export/download",
+                headers=headers
             ) as response:
-                if response.status != 200:
+                response.raise_for_status()
+
+                if response.status == 403:
+                    self.log(f"Access forbidden to download {project_path}.", "ERROR")
+                    return False
+
+                if response.status not in [200, 206]:
                     self.log(f"Failed to download export for {project_path}: {response.status}", "ERROR")
                     return False
-                    
-                total_size = int(response.headers.get('content-length', 0))
+
+                total_size = int(response.headers.get('Content-Length', 0))
                 
-                with open(export_file, 'wb') as f:
-                    downloaded = 0
+                with open(export_file, file_mode) as f:
                     async for chunk in response.content.iter_chunked(8192):
                         f.write(chunk)
-                        downloaded += len(chunk)
-                
+
                 self.stats.total_size += total_size
-                self.log(f"Downloaded {project_path} ({total_size / 1024 / 1024:.1f} MB)", "SUCCESS")
-                return True
+                size_in_mb = (downloaded_size + total_size) / 1024 / 1024
                 
+                if file_mode == 'ab':
+                    self.log(f"Resumed and completed download for {project_path} ({size_in_mb:.1f} MB)", "SUCCESS")
+                else:
+                    self.log(f"Downloaded {project_path} ({size_in_mb:.1f} MB)", "SUCCESS")
+                return True
+
         except Exception as e:
             self.log(f"Exception downloading {project_path}: {str(e)}", "ERROR")
             return False
             
-    async def export_wikis(self, projects: List[Dict]) -> None:
+    async def export_wikis(self, projects: List[Dict], semaphore: asyncio.Semaphore) -> None:
         """Export wikis for all projects"""
         wiki_count = 0
         
@@ -307,13 +373,14 @@ class GitLabAsyncExporter:
                 wiki_path.mkdir(parents=True, exist_ok=True)
                 
                 # Get wiki pages
-                async with self.session.get(
-                    f"{self.instance.url}/api/v4/projects/{project['id']}/wikis"
-                ) as response:
-                    if response.status != 200:
-                        continue
-                        
-                    wiki_pages = await response.json()
+                async with semaphore:
+                    async with self.session.get(
+                        f"{self.instance.url}/api/v4/projects/{project['id']}/wikis"
+                    ) as response:
+                        if response.status != 200:
+                            continue
+
+                        wiki_pages = await response.json()
                     if not wiki_pages:
                         continue
                         
@@ -340,20 +407,21 @@ class GitLabAsyncExporter:
                 
         self.log(f"Exported {wiki_count} wikis", "SUCCESS")
         
-    async def export_snippets(self, projects: List[Dict]) -> None:
+    async def export_snippets(self, projects: List[Dict], semaphore: asyncio.Semaphore) -> None:
         """Export snippets for all projects"""
         snippet_count = 0
         
         for project in projects:
             try:
                 # Get project snippets
-                async with self.session.get(
-                    f"{self.instance.url}/api/v4/projects/{project['id']}/snippets"
-                ) as response:
-                    if response.status != 200:
-                        continue
-                        
-                    snippets = await response.json()
+                async with semaphore:
+                    async with self.session.get(
+                        f"{self.instance.url}/api/v4/projects/{project['id']}/snippets"
+                    ) as response:
+                        if response.status != 200:
+                            continue
+
+                        snippets = await response.json()
                     if not snippets:
                         continue
                         
@@ -383,7 +451,7 @@ class GitLabAsyncExporter:
                 
         self.log(f"Exported {snippet_count} snippets", "SUCCESS")
         
-    async def export_metadata(self, projects: List[Dict]) -> None:
+    async def export_metadata(self, projects: List[Dict], semaphore: asyncio.Semaphore) -> None:
         """Export project metadata (issues, merge requests, etc.)"""
         metadata_dir = self.export_dir / "metadata"
         metadata_dir.mkdir(exist_ok=True)
@@ -398,13 +466,14 @@ class GitLabAsyncExporter:
                     issues = []
                     page = 1
                     while True:
-                        async with self.session.get(
-                            f"{self.instance.url}/api/v4/projects/{project['id']}/issues",
-                            params={'page': page, 'per_page': 100}
-                        ) as response:
-                            if response.status != 200:
-                                break
-                            page_issues = await response.json()
+                        async with semaphore:
+                            async with self.session.get(
+                                f"{self.instance.url}/api/v4/projects/{project['id']}/issues",
+                                params={'page': page, 'per_page': 100}
+                            ) as response:
+                                if response.status != 200:
+                                    break
+                                page_issues = await response.json()
                             if not page_issues:
                                 break
                             issues.extend(page_issues)
@@ -503,9 +572,7 @@ class TUIInterface:
         
     async def load_instances(self) -> bool:
         """Load GitLab instances from configuration"""
-        # Check for config.json first
         config_file = Path("config.json")
-        instances_file = Path("gitlab_instances.txt")
         
         if config_file.exists():
             with open(config_file, 'r') as f:
@@ -516,36 +583,9 @@ class TUIInterface:
                         url=inst['url'],
                         token=inst['token']
                     ))
-                    
-        elif instances_file.exists():
-            # Parse the custom format
-            content = instances_file.read_text()
-            lines = content.strip().split('\n')
-            
-            current_instance = None
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Check for instance URL line
-                if line.startswith('http'):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        url = parts[0]
-                        name = urlparse(url).netloc.split('.')[0]
-                        current_instance = GitLabInstance(name=name, url=url, token="")
-                        self.instances.append(current_instance)
-                        
-                # Check for token line
-                elif current_instance and 'TOKΞN:' in line or 'TOKEN:' in line:
-                    token_match = re.search(r'TOK[ΞE]N:\s*(\S+)', line)
-                    if token_match:
-                        current_instance.token = token_match.group(1)
-                        
         else:
             self.console.print("[red]No configuration found![/red]")
-            self.console.print("Please create config.json or gitlab_instances.txt")
+            self.console.print("Please run `python convert_config.py` to create a configuration file.")
             return False
             
         return len(self.instances) > 0
@@ -566,6 +606,27 @@ class TUIInterface:
         
     async def run_export(self, selected_instances: List[GitLabInstance]):
         """Run the export process with progress tracking"""
+        config_file = Path("config.json")
+        config = {}
+        if config_file.exists():
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+
+        max_concurrent_downloads = Prompt.ask(
+            "[bold cyan]Enter max concurrent downloads[/bold cyan]",
+            default=str(config.get("max_concurrent_downloads", 5))
+        )
+        config["max_concurrent_downloads"] = int(max_concurrent_downloads)
+
+        max_concurrent_api_calls = Prompt.ask(
+            "[bold cyan]Enter max concurrent API calls[/bold cyan]",
+            default=str(config.get("max_concurrent_api_calls", 10))
+        )
+        config["max_concurrent_api_calls"] = int(max_concurrent_api_calls)
+
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -578,7 +639,12 @@ class TUIInterface:
             for instance in selected_instances:
                 self.console.print(f"\n[bold cyan]Processing {instance.name}...[/bold cyan]")
                 
-                async with GitLabAsyncExporter(instance, Path("exports"), max_concurrent=3) as exporter:
+                async with GitLabAsyncExporter(
+                    instance,
+                    Path("exports"),
+                    max_concurrent_downloads=int(max_concurrent_downloads),
+                    max_concurrent_api_calls=int(max_concurrent_api_calls)
+                ) as exporter:
                     exporter.progress = progress
                     
                     # Validate connection
@@ -596,7 +662,7 @@ class TUIInterface:
                         total=None
                     )
                     
-                    projects = await exporter.get_all_projects(fetch_task)
+                    projects = await exporter.get_all_projects(api_semaphore, fetch_task)
                     progress.remove_task(fetch_task)
                     
                     if not projects:
@@ -611,12 +677,13 @@ class TUIInterface:
                         total=len(projects)
                     )
                     
-                    # Create semaphore for concurrency control
-                    semaphore = asyncio.Semaphore(exporter.max_concurrent)
-                    
+                    # Create semaphores for concurrency control
+                    download_semaphore = asyncio.Semaphore(exporter.max_concurrent_downloads)
+                    api_semaphore = asyncio.Semaphore(exporter.max_concurrent_api_calls)
+
                     # Export all projects concurrently
                     export_tasks = [
-                        exporter.export_project(project, semaphore, export_task)
+                        exporter.export_project(project, download_semaphore, export_task)
                         for project in projects
                     ]
                     
@@ -624,9 +691,9 @@ class TUIInterface:
                     
                     # Export additional data
                     self.console.print(f"[cyan]Exporting wikis and snippets...[/cyan]")
-                    await exporter.export_wikis(projects)
-                    await exporter.export_snippets(projects)
-                    await exporter.export_metadata(projects)
+                    await exporter.export_wikis(projects, api_semaphore)
+                    await exporter.export_snippets(projects, api_semaphore)
+                    await exporter.export_metadata(projects, api_semaphore)
                     
                     # Save export report
                     report = {
@@ -641,9 +708,10 @@ class TUIInterface:
                             'snippets_exported': exporter.stats.snippets_exported,
                             'total_size_gb': exporter.stats.total_size / 1024 / 1024 / 1024,
                             'elapsed_seconds': exporter.stats.elapsed_time,
-                            'success_rate': exporter.stats.success_rate
+                            'success_rate': exporter.stats.success_rate,
+                            'retries': exporter.stats.retries
                         },
-                        'failed_projects': []  # Would need to track this
+                        'failed_projects': [p['path_with_namespace'] for p in exporter.failed_projects]
                     }
                     
                     with open(exporter.export_dir / "export_report.json", 'w') as f:
@@ -657,6 +725,7 @@ class TUIInterface:
                     
                     summary_table.add_row("Projects Exported", str(exporter.stats.projects_exported))
                     summary_table.add_row("Projects Failed", str(exporter.stats.projects_failed))
+                    summary_table.add_row("Retries", str(exporter.stats.retries))
                     summary_table.add_row("Wikis Exported", str(exporter.stats.wikis_exported))
                     summary_table.add_row("Snippets Exported", str(exporter.stats.snippets_exported))
                     summary_table.add_row("Total Size", f"{exporter.stats.total_size / 1024 / 1024 / 1024:.2f} GB")
