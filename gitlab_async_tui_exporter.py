@@ -650,7 +650,6 @@ class TUIInterface:
         with open(config_file, 'w') as f:
             json.dump(config, f, indent=2)
 
-        # Create semaphores for concurrency control
         download_semaphore = asyncio.Semaphore(int(max_concurrent_downloads))
         api_semaphore = asyncio.Semaphore(int(max_concurrent_api_calls))
 
