@@ -572,9 +572,7 @@ class TUIInterface:
         
     async def load_instances(self) -> bool:
         """Load GitLab instances from configuration"""
-        # Check for config.json first
         config_file = Path("config.json")
-        instances_file = Path("gitlab_instances.txt")
         
         if config_file.exists():
             with open(config_file, 'r') as f:
@@ -585,36 +583,9 @@ class TUIInterface:
                         url=inst['url'],
                         token=inst['token']
                     ))
-                    
-        elif instances_file.exists():
-            # Parse the custom format
-            content = instances_file.read_text()
-            lines = content.strip().split('\n')
-            
-            current_instance = None
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                    
-                # Check for instance URL line
-                if line.startswith('http'):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        url = parts[0]
-                        name = urlparse(url).netloc.split('.')[0]
-                        current_instance = GitLabInstance(name=name, url=url, token="")
-                        self.instances.append(current_instance)
-                        
-                # Check for token line
-                elif current_instance and 'TOKΞN:' in line or 'TOKEN:' in line:
-                    token_match = re.search(r'TOK[ΞE]N:\s*(\S+)', line)
-                    if token_match:
-                        current_instance.token = token_match.group(1)
-                        
         else:
             self.console.print("[red]No configuration found![/red]")
-            self.console.print("Please create config.json or gitlab_instances.txt")
+            self.console.print("Please run `python convert_config.py` to create a configuration file.")
             return False
             
         return len(self.instances) > 0
