@@ -70,3 +70,4 @@ desktop.ini
 *.tmp
 *.temp
 /tmp/
+retry_queue.json
